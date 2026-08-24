@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,17 +18,29 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             platform: macos
-          - os: windows-latest
+            arch: apple-silicon
+          - os: macos-15-intel
+            platform: macos
+            arch: intel
+          - os: windows-2025
             platform: windows
-          - os: ubuntu-latest
+            arch: x64
+          - os: windows-11-arm
+            platform: windows
+            arch: arm64
+          - os: ubuntu-24.04
             platform: linux
+            arch: x64
+          - os: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -36,15 +49,24 @@ jobs:
       - name: Resolve and validate the release version
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Release tags must use vMAJOR.MINOR.PATCH, for example v1.2.3" >&2
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Release tags must use vMAJOR.MINOR.PATCH, for example v1.2.3" >&2
+              exit 1
+            fi
+          else
+            version="$cargo_version"
+          fi
+
+          if [[ "$version" != "$cargo_version" ]]; then
+            echo "Release version $version does not match Cargo.toml version $cargo_version" >&2
             exit 1
           fi
 
-          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          if [[ "$version" != "$cargo_version" ]]; then
-            echo "Tag version $version does not match Cargo.toml version $cargo_version" >&2
+          if ! grep -q "<release version=\"$version\"" packaging/linux/io.github.scorpion7slayer.minime.metainfo.xml; then
+            echo "The latest Flatpak metainfo release must match version $version" >&2
             exit 1
           fi
 
@@ -67,11 +89,29 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build Windows or Linux binary
-        if: runner.os != 'macOS'
+      - name: Build the native release binary
         env:
           MINIME_APP_ID: ${{ env.OFFICIAL_BUNDLE_ID }}
-        run: cargo build --release
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo build --release --locked
+
+      - name: Validate the Windows binary type and architecture
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Binary = (Resolve-Path "target/release/minime.exe").Path
+          $Bytes = [System.IO.File]::ReadAllBytes($Binary)
+          $PeOffset = [BitConverter]::ToInt32($Bytes, 0x3c)
+          $Machine = [BitConverter]::ToUInt16($Bytes, $PeOffset + 4)
+          $Subsystem = [BitConverter]::ToUInt16($Bytes, $PeOffset + 24 + 68)
+          $ExpectedMachine = if ("${{ matrix.arch }}" -eq "x64") { 0x8664 } else { 0xaa64 }
+
+          if ($Machine -ne $ExpectedMachine) {
+              throw "Expected PE machine 0x$($ExpectedMachine.ToString('x4')), found 0x$($Machine.ToString('x4'))"
+          }
+          if ($Subsystem -ne 2) {
+              throw "Expected the Windows GUI subsystem (2), found $Subsystem"
+          }
 
       - name: Install the Developer ID certificate
         if: runner.os == 'macOS'
@@ -86,7 +126,7 @@ jobs:
           keychain_path="$RUNNER_TEMP/minime-signing.keychain-db"
           keychain_password="$(openssl rand -hex 32)"
 
-          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$certificate_path"
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode -o "$certificate_path"
           security create-keychain -p "$keychain_password" "$keychain_path"
           security set-keychain-settings -lut 21600 "$keychain_path"
           security unlock-keychain -p "$keychain_password" "$keychain_path"
@@ -112,6 +152,7 @@ jobs:
         if: runner.os == 'macOS'
         env:
           MINIME_RELEASE: "1"
+          MINIME_BINARY_PATH: ${{ github.workspace }}/target/release/minime
           MINIME_BUNDLE_ID: ${{ env.OFFICIAL_BUNDLE_ID }}
           MINIME_BUILD_NUMBER: ${{ github.run_number }}
           MINIME_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
@@ -124,18 +165,64 @@ jobs:
           MINIME_NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
           MINIME_NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           MINIME_NOTARY_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          ./scripts/notarize-macos.sh
-          cp "dist/Minime-${MINIME_VERSION}-macos.zip" .
+        run: ./scripts/notarize-macos.sh
 
-      - name: Package Windows binary
+      - name: Create the macOS DMG
+        if: runner.os == 'macOS'
+        env:
+          MINIME_RELEASE_ARCH: ${{ matrix.arch }}
+          MINIME_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          export MINIME_DMG_OUTPUT="$GITHUB_WORKSPACE/Minime-${MINIME_VERSION}-macos-${{ matrix.arch }}.dmg"
+          ./scripts/create-macos-dmg.sh
+
+      - name: Notarize and staple the macOS DMG
+        if: runner.os == 'macOS'
+        env:
+          MINIME_NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          MINIME_NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MINIME_NOTARY_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          export MINIME_DMG_PATH="$GITHUB_WORKSPACE/Minime-${MINIME_VERSION}-macos-${{ matrix.arch }}.dmg"
+          ./scripts/notarize-macos-dmg.sh
+
+      - name: Build the Windows installer
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/release/minime.exe -DestinationPath "Minime-$env:MINIME_VERSION-windows.zip"
+        run: |
+          $Candidates = @(
+              (Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+              "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+              "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+          )
+          $Iscc = $Candidates | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $Iscc) {
+              throw "Inno Setup 6 was not found on the GitHub runner"
+          }
 
-      - name: Package Linux binary
+          $Binary = (Resolve-Path "target/release/minime.exe").Path
+          $Output = (Resolve-Path ".").Path
+          & $Iscc `
+              "/DMyAppVersion=$env:MINIME_VERSION" `
+              "/DMyAppArch=${{ matrix.arch }}" `
+              "/DMyAppBinary=$Binary" `
+              "/DMyOutputDir=$Output" `
+              "packaging/windows/Minime.iss"
+          if ($LASTEXITCODE -ne 0) {
+              throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+
+          $Installer = "Minime-$env:MINIME_VERSION-windows-${{ matrix.arch }}-setup.exe"
+          if (-not (Test-Path -LiteralPath $Installer -PathType Leaf)) {
+              throw "The expected Windows installer was not created: $Installer"
+          }
+
+      - name: Package the Linux archive
         if: runner.os == 'Linux'
-        run: tar -czf "Minime-${MINIME_VERSION}-linux.tar.gz" -C target/release minime
+        run: |
+          tar -czf "Minime-${MINIME_VERSION}-linux-${{ matrix.arch }}.tar.gz" -C target/release minime
+          mkdir -p flatpak-input
+          install -m 755 target/release/minime "flatpak-input/minime-${{ matrix.arch }}"
 
       - name: Remove the temporary signing keychain
         if: always() && runner.os == 'macOS'
@@ -147,16 +234,73 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: Minime-${{ github.ref_name }}-${{ matrix.platform }}
+          name: Minime-build-${{ matrix.platform }}-${{ matrix.arch }}
           path: |
-            Minime-*-macos.zip
-            Minime-*-windows.zip
-            Minime-*-linux.tar.gz
+            Minime-*.dmg
+            Minime-*-setup.exe
+            Minime-*.tar.gz
+            flatpak-input/minime-*
+          if-no-files-found: error
+
+  flatpak:
+    name: Build Flatpak ${{ matrix.arch }}
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            release_arch: x64
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            release_arch: arm64
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: Minime-build-linux-${{ matrix.release_arch }}
+          path: downloaded-linux-build
+
+      - name: Stage the native binary
+        run: |
+          mkdir -p target/release
+          install -m 755 \
+            "downloaded-linux-build/flatpak-input/minime-${{ matrix.release_arch }}" \
+            target/release/minime
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: Minime-linux-${{ matrix.release_arch }}.flatpak
+          manifest-path: packaging/linux/io.github.scorpion7slayer.minime.yml
+          cache-key: minime-flatpak-${{ github.sha }}
+          arch: ${{ matrix.arch }}
+          upload-artifact: false
+
+      - name: Give the Flatpak bundle its release version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          mv \
+            "Minime-linux-${{ matrix.release_arch }}.flatpak" \
+            "Minime-${version}-linux-${{ matrix.release_arch }}.flatpak"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Minime-build-flatpak-${{ matrix.release_arch }}
+          path: Minime-*-linux-${{ matrix.release_arch }}.flatpak
           if-no-files-found: error
 
   publish:
     name: Publish GitHub Release
-    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [build, flatpak]
     runs-on: ubuntu-latest
 
     steps:
@@ -164,42 +308,62 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: Minime-v*-*
+          pattern: Minime-build-*
           merge-multiple: true
-          path: release-assets
+          path: downloaded-assets
+
+      - name: Collect release packages
+        shell: bash
+        run: |
+          mkdir release-assets
+          cp downloaded-assets/Minime-* release-assets/
 
       - name: Build the in-app update installers
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          macos_asset="release-assets/Minime-${version}-macos.zip"
-          windows_asset="release-assets/Minime-${version}-windows.zip"
-          linux_asset="release-assets/Minime-${version}-linux.tar.gz"
+          macos_apple_silicon_asset="release-assets/Minime-${version}-macos-apple-silicon.dmg"
+          macos_intel_asset="release-assets/Minime-${version}-macos-intel.dmg"
+          windows_x64_asset="release-assets/Minime-${version}-windows-x64-setup.exe"
+          windows_arm64_asset="release-assets/Minime-${version}-windows-arm64-setup.exe"
+          linux_x64_asset="release-assets/Minime-${version}-linux-x64.tar.gz"
+          linux_arm64_asset="release-assets/Minime-${version}-linux-arm64.tar.gz"
 
-          macos_sha="$(sha256sum "$macos_asset" | cut -d ' ' -f 1)"
-          windows_sha="$(sha256sum "$windows_asset" | cut -d ' ' -f 1)"
-          linux_sha="$(sha256sum "$linux_asset" | cut -d ' ' -f 1)"
+          macos_apple_silicon_sha="$(sha256sum "$macos_apple_silicon_asset" | cut -d ' ' -f 1)"
+          macos_intel_sha="$(sha256sum "$macos_intel_asset" | cut -d ' ' -f 1)"
+          windows_x64_sha="$(sha256sum "$windows_x64_asset" | cut -d ' ' -f 1)"
+          windows_arm64_sha="$(sha256sum "$windows_arm64_asset" | cut -d ' ' -f 1)"
+          linux_x64_sha="$(sha256sum "$linux_x64_asset" | cut -d ' ' -f 1)"
+          linux_arm64_sha="$(sha256sum "$linux_arm64_asset" | cut -d ' ' -f 1)"
 
           sed \
             -e "s/__VERSION__/$version/g" \
-            -e "s/__MACOS_SHA256__/$macos_sha/g" \
-            -e "s/__LINUX_SHA256__/$linux_sha/g" \
+            -e "s/__MACOS_APPLE_SILICON_SHA256__/$macos_apple_silicon_sha/g" \
+            -e "s/__MACOS_INTEL_SHA256__/$macos_intel_sha/g" \
+            -e "s/__LINUX_X64_SHA256__/$linux_x64_sha/g" \
+            -e "s/__LINUX_ARM64_SHA256__/$linux_arm64_sha/g" \
             packaging/update/minime-installer.sh.in \
             > release-assets/minime-installer.sh
           chmod +x release-assets/minime-installer.sh
 
           sed \
             -e "s/__VERSION__/$version/g" \
-            -e "s/__WINDOWS_SHA256__/$windows_sha/g" \
+            -e "s/__WINDOWS_X64_SHA256__/$windows_x64_sha/g" \
+            -e "s/__WINDOWS_ARM64_SHA256__/$windows_arm64_sha/g" \
             packaging/update/minime-installer.ps1.in \
             > release-assets/minime-installer.ps1
 
           (
             cd release-assets
             sha256sum \
-              "Minime-${version}-macos.zip" \
-              "Minime-${version}-windows.zip" \
-              "Minime-${version}-linux.tar.gz" \
+              "Minime-${version}-macos-apple-silicon.dmg" \
+              "Minime-${version}-macos-intel.dmg" \
+              "Minime-${version}-windows-x64-setup.exe" \
+              "Minime-${version}-windows-arm64-setup.exe" \
+              "Minime-${version}-linux-x64.tar.gz" \
+              "Minime-${version}-linux-arm64.tar.gz" \
+              "Minime-${version}-linux-x64.flatpak" \
+              "Minime-${version}-linux-arm64.flatpak" \
               minime-installer.sh \
               minime-installer.ps1 \
               > SHA256SUMS

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.scorpion7slayer.minime</id>
+  <name>Minime</name>
+  <summary>Compress and convert images without losing pixels</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Minime makes image files smaller or converts them to another lossless
+      format. Every image stays on the device, and generated files are checked
+      pixel by pixel before they are saved.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.scorpion7slayer.minime.desktop</launchable>
+  <url type="homepage">https://github.com/scorpion7slayer/Minime</url>
+  <url type="bugtracker">https://github.com/scorpion7slayer/Minime/issues</url>
+  <developer id="io.github.scorpion7slayer">
+    <name>scorpion7slayer</name>
+  </developer>
+  <categories>
+    <category>Graphics</category>
+    <category>Utility</category>
+  </categories>
+  <releases>
+    <release version="0.2.0" date="2026-08-24"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

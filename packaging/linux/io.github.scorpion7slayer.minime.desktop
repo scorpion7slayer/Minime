@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Minime
+Comment=Compress and convert images without losing pixels
+Exec=minime
+Icon=io.github.scorpion7slayer.minime
+Terminal=false
+Categories=Graphics;Utility;
+Keywords=image;compression;converter;lossless;png;webp;
+StartupNotify=true

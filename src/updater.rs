@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
-use axoupdater::{AxoUpdater, ReleaseSource, ReleaseSourceType, Version};
+use axoupdater::{AxoUpdater, AxoupdateError, ReleaseSource, ReleaseSourceType, Version};
 
 pub const AUTOMATIC_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
@@ -19,7 +19,9 @@ const OFFICIAL_APP_ID: &str = "io.github.scorpion7slayer.minime";
 pub enum UpdateCheck {
     DevelopmentBuild,
     UpToDate,
+    FeedUnavailable,
     Available { version: String },
+    ManagedExternally { version: String },
 }
 
 #[derive(Debug, Clone)]
@@ -56,20 +58,29 @@ pub fn check_for_update() -> Result<UpdateCheck> {
         .enable_all()
         .build()
         .context("Unable to start the update client")?;
-    let latest_version = runtime
-        .block_on(async {
-            updater
-                .query_new_version()
-                .await
-                .map(|version| version.cloned())
-        })
-        .context("Unable to read the latest Minime release")?
-        .context("The latest Minime release has no version")?;
+    let latest_version = match runtime.block_on(async {
+        updater
+            .query_new_version()
+            .await
+            .map(|version| version.cloned())
+    }) {
+        Ok(Some(version)) => version,
+        Ok(None) => return Ok(UpdateCheck::UpToDate),
+        Err(AxoupdateError::NoStableReleases { .. }) => {
+            return Ok(UpdateCheck::FeedUnavailable);
+        }
+        Err(error) => {
+            return Err(error).context("Unable to read the latest Minime release");
+        }
+    };
 
     if latest_version > current_version {
-        Ok(UpdateCheck::Available {
-            version: latest_version.to_string(),
-        })
+        let version = latest_version.to_string();
+        if is_flatpak() {
+            Ok(UpdateCheck::ManagedExternally { version })
+        } else {
+            Ok(UpdateCheck::Available { version })
+        }
     } else {
         Ok(UpdateCheck::UpToDate)
     }
@@ -79,6 +90,12 @@ pub fn install_update() -> Result<InstallOutcome> {
     if !is_official_build() {
         return Err(anyhow!(
             "Updates can only be installed from an official Minime build"
+        ));
+    }
+
+    if is_flatpak() {
+        return Err(anyhow!(
+            "This copy is managed by Flatpak. Install the update through Minime's Flatpak source."
         ));
     }
 
@@ -163,6 +180,10 @@ fn is_official_build() -> bool {
     option_env!("MINIME_APP_ID") == Some(OFFICIAL_APP_ID)
 }
 
+fn is_flatpak() -> bool {
+    env::var_os("FLATPAK_ID").is_some()
+}
+
 fn install_directory() -> Result<PathBuf> {
     env::current_exe()?
         .parent()
@@ -221,7 +242,7 @@ fn backup_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn cleanup_update_backup_inner() -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let executable = env::current_exe().context("Unable to locate the Minime executable")?;
 
     #[cfg(target_os = "macos")]
@@ -238,6 +259,16 @@ fn cleanup_update_backup_inner() -> Result<()> {
         let backup = backup_path(&executable)?;
         if backup.is_file() {
             fs::remove_file(backup)?;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut backup_name = executable.as_os_str().to_os_string();
+        backup_name.push(".previous.exe");
+        let backup = PathBuf::from(backup_name);
+        if backup.is_file() {
+            std::fs::remove_file(backup)?;
         }
     }
 

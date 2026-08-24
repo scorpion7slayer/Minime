@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 mod localization;
 mod preferences;
 mod updater;
@@ -233,7 +238,9 @@ enum UpdateStatus {
     Checking,
     UpToDate,
     DevelopmentBuild,
+    FeedUnavailable,
     Available { version: String },
+    ManagedExternally { version: String },
     Installing { version: String },
     CheckFailed,
     InstallFailed,
@@ -475,7 +482,11 @@ impl MinimeApp {
                 this.update_status = match result {
                     Ok(UpdateCheck::DevelopmentBuild) => UpdateStatus::DevelopmentBuild,
                     Ok(UpdateCheck::UpToDate) => UpdateStatus::UpToDate,
+                    Ok(UpdateCheck::FeedUnavailable) => UpdateStatus::FeedUnavailable,
                     Ok(UpdateCheck::Available { version }) => UpdateStatus::Available { version },
+                    Ok(UpdateCheck::ManagedExternally { version }) => {
+                        UpdateStatus::ManagedExternally { version }
+                    }
                     Err(error) => {
                         log::warn!("Unable to check for a Minime update: {error:#}");
                         UpdateStatus::CheckFailed
@@ -2974,6 +2985,12 @@ impl MinimeApp {
                     "Update checks are available in official builds.",
                 )
                 .into(),
+            UpdateStatus::FeedUnavailable => self
+                .text(
+                    "Le flux de mises à jour n’est pas encore public. Réessayez après la publication du dépôt GitHub.",
+                    "The update feed isn’t public yet. Try again after the GitHub repository is published.",
+                )
+                .into(),
             UpdateStatus::Available { version } => {
                 format!(
                     "{} {version} {}",
@@ -2981,6 +2998,14 @@ impl MinimeApp {
                     self.text("est disponible.", "is available.")
                 )
             }
+            UpdateStatus::ManagedExternally { version } => format!(
+                "{} {version} {}",
+                self.text("Minime", "Minime"),
+                self.text(
+                    "est disponible via votre source Flatpak.",
+                    "is available through your Flatpak source."
+                )
+            ),
             UpdateStatus::Installing { version } => format!(
                 "{} {version}…",
                 self.text("Installation de Minime", "Installing Minime")
@@ -3108,10 +3133,12 @@ impl MinimeApp {
                             .mt(px(-4.0))
                             .text_xs()
                             .text_color(match self.update_status {
-                                UpdateStatus::Available { .. } | UpdateStatus::UpToDate => {
-                                    rgb(GREEN_INK)
-                                }
-                                UpdateStatus::CheckFailed | UpdateStatus::InstallFailed => {
+                                UpdateStatus::Available { .. }
+                                | UpdateStatus::ManagedExternally { .. }
+                                | UpdateStatus::UpToDate => rgb(GREEN_INK),
+                                UpdateStatus::FeedUnavailable
+                                | UpdateStatus::CheckFailed
+                                | UpdateStatus::InstallFailed => {
                                     rgb(RED_INK)
                                 }
                                 _ => rgb(MUTED),
@@ -3125,10 +3152,11 @@ impl MinimeApp {
 
     fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let rgb = self.rgb();
-        let version = match &self.update_status {
+        let (version, managed_externally) = match &self.update_status {
             UpdateStatus::Available { version } | UpdateStatus::Installing { version } => {
-                version.clone()
+                (version.clone(), false)
             }
+            UpdateStatus::ManagedExternally { version } => (version.clone(), true),
             _ => return None,
         };
         let installing = matches!(self.update_status, UpdateStatus::Installing { .. });
@@ -3155,6 +3183,15 @@ impl MinimeApp {
                                     "{} {version}…",
                                     self.text("Installation de Minime", "Installing Minime")
                                 )
+                            } else if managed_externally {
+                                format!(
+                                    "{} {version} {}",
+                                    self.text("Minime", "Minime"),
+                                    self.text(
+                                        "est disponible via Flatpak.",
+                                        "is available through Flatpak."
+                                    )
+                                )
                             } else {
                                 format!(
                                     "{} {version} {}",
@@ -3164,7 +3201,7 @@ impl MinimeApp {
                             },
                         )),
                 )
-                .when(!installing, |banner| {
+                .when(!installing && !managed_externally, |banner| {
                     banner.child(
                         self.animate_button(
                             div()

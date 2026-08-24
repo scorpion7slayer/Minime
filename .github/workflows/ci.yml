@@ -40,13 +40,25 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check
-        run: cargo check --all-targets
+        run: cargo check --all-targets --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test compression engine
-        run: cargo test --lib
+        run: cargo test --lib --locked
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Verify the Windows release is a GUI application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Binary = (Resolve-Path "target/release/minime.exe").Path
+          $Bytes = [System.IO.File]::ReadAllBytes($Binary)
+          $PeOffset = [BitConverter]::ToInt32($Bytes, 0x3c)
+          $Subsystem = [BitConverter]::ToUInt16($Bytes, $PeOffset + 24 + 68)
+          if ($Subsystem -ne 2) {
+              throw "Expected the Windows GUI subsystem (2), found $Subsystem"
+          }

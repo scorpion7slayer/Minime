@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="660" height="420" viewBox="0 0 660 420">
+  <rect width="660" height="420" fill="#f6f4ef"/>
+  <rect width="660" height="58" fill="#20232b"/>
+  <g transform="translate(20 11) scale(0.03515625)">
+    <rect x="48" y="48" width="928" height="928" rx="220" fill="#f7f5ef"/>
+    <rect x="238" y="286" width="548" height="92" rx="46" fill="#20232b"/>
+    <rect x="326" y="466" width="372" height="92" rx="46" fill="#20232b"/>
+    <rect x="414" y="646" width="196" height="92" rx="46" fill="#9fc9df"/>
+  </g>
+  <text x="68" y="37"
+        fill="#f7f5ef"
+        font-family="-apple-system, BlinkMacSystemFont, sans-serif"
+        font-size="22"
+        font-weight="650">Minime</text>
+  <text x="638" y="35"
+        text-anchor="end"
+        fill="#aeb3c0"
+        font-family="-apple-system, BlinkMacSystemFont, sans-serif"
+        font-size="12"
+        font-weight="500">Private · Lossless · Local</text>
+
+  <circle cx="170" cy="210" r="82" fill="#ffffff" stroke="#e4e0d8" stroke-width="1"/>
+  <circle cx="490" cy="210" r="82" fill="#ffffff" stroke="#e4e0d8" stroke-width="1"/>
+
+  <path d="M 274 217 C 302 191, 350 191, 382 211"
+        fill="none"
+        stroke="#24272e"
+        stroke-width="7"
+        stroke-linecap="round"/>
+  <path d="M 365 194 L 386 212 L 365 230"
+        fill="none"
+        stroke="#24272e"
+        stroke-width="7"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+  <rect y="360" width="660" height="60" fill="#e8e5df"/>
+  <text x="330" y="394"
+        text-anchor="middle"
+        fill="#343740"
+        font-family="-apple-system, BlinkMacSystemFont, sans-serif"
+        font-size="15"
+        font-weight="600">Drag Minime to Applications</text>
+</svg>

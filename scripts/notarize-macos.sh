@@ -51,7 +51,6 @@ else
 fi
 
 submission_archive="$temporary_root/Minime-$version-notarization.zip"
-release_archive="$project_dir/dist/Minime-$version-macos.zip"
 
 ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$submission_archive"
 xcrun notarytool submit "$submission_archive" "${notary_arguments[@]}" --wait
@@ -60,7 +59,4 @@ xcrun stapler validate "$app_bundle"
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 spctl --assess --type execute --verbose=4 "$app_bundle"
 
-rm -f "$release_archive"
-ditto -c -k --sequesterRsrc --keepParent "$app_bundle" "$release_archive"
-
-echo "Created notarized release archive: $release_archive"
+echo "Notarized and stapled $app_bundle"

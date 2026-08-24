@@ -4,22 +4,35 @@ set -eu
 VERSION="__VERSION__"
 RELEASE_ROOT="https://github.com/scorpion7slayer/Minime/releases/download/v${VERSION}"
 INSTALL_DIR="${CARGO_DIST_FORCE_INSTALL_DIR:-${MINIME_INSTALL_DIR:-}}"
+TEMP_DIR=""
+DMG_MOUNT=""
 
 fail() {
   printf '%s\n' "Minime update failed: $*" >&2
   exit 1
 }
 
+cleanup() {
+  if [ -n "$DMG_MOUNT" ]; then
+    hdiutil detach "$DMG_MOUNT" -quiet >/dev/null 2>&1 || true
+  fi
+  if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+    rm -rf "$TEMP_DIR"
+  fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
 [ -n "$INSTALL_DIR" ] || fail "the install directory is missing"
 [ -d "$INSTALL_DIR" ] || fail "the install directory does not exist"
 
 TEMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TEMP_DIR"' EXIT HUP INT TERM
+DOWNLOADED_PATH=""
 
 download_and_verify() {
   asset_name="$1"
   expected_sha="$2"
-  archive_path="$TEMP_DIR/$asset_name"
+  DOWNLOADED_PATH="$TEMP_DIR/$asset_name"
 
   curl \
     --proto '=https' \
@@ -29,35 +42,79 @@ download_and_verify() {
     --silent \
     --show-error \
     "$RELEASE_ROOT/$asset_name" \
-    --output "$archive_path"
+    --output "$DOWNLOADED_PATH"
 
   if command -v sha256sum >/dev/null 2>&1; then
-    actual_sha="$(sha256sum "$archive_path" | awk '{print $1}')"
+    actual_sha="$(sha256sum "$DOWNLOADED_PATH" | awk '{print $1}')"
   else
-    actual_sha="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+    actual_sha="$(shasum -a 256 "$DOWNLOADED_PATH" | awk '{print $1}')"
   fi
-  [ "$actual_sha" = "$expected_sha" ] || fail "the downloaded archive checksum does not match"
+
+  [ "$actual_sha" = "$expected_sha" ] \
+    || fail "the downloaded package checksum does not match"
 }
+
+machine="$(uname -m)"
 
 case "$(uname -s)" in
   Darwin)
-    ASSET_NAME="Minime-${VERSION}-macos.zip"
-    EXPECTED_SHA="__MACOS_SHA256__"
+    case "$machine" in
+      arm64 | aarch64)
+        RELEASE_ARCH="apple-silicon"
+        BINARY_ARCH="arm64"
+        EXPECTED_SHA="__MACOS_APPLE_SILICON_SHA256__"
+        ;;
+      x86_64 | amd64)
+        RELEASE_ARCH="intel"
+        BINARY_ARCH="x86_64"
+        EXPECTED_SHA="__MACOS_INTEL_SHA256__"
+        ;;
+      *)
+        fail "unsupported macOS architecture: $machine"
+        ;;
+    esac
+
+    ASSET_NAME="Minime-${VERSION}-macos-${RELEASE_ARCH}.dmg"
     case "$INSTALL_DIR" in
       */Contents/MacOS) ;;
       *) fail "Minime is not running from a standard application bundle" ;;
     esac
 
     APP_BUNDLE="$(cd "$INSTALL_DIR/../.." && pwd -P)"
-    [ "$(basename "$APP_BUNDLE")" = "Minime.app" ] || fail "rename the app to Minime.app before updating"
+    [ "$(basename "$APP_BUNDLE")" = "Minime.app" ] \
+      || fail "rename the app to Minime.app before updating"
     BACKUP_BUNDLE="${APP_BUNDLE}.minime-backup"
-    [ ! -e "$BACKUP_BUNDLE" ] || fail "a previous update backup still exists"
+    [ ! -e "$BACKUP_BUNDLE" ] \
+      || fail "a previous update backup still exists"
 
     download_and_verify "$ASSET_NAME" "$EXPECTED_SHA"
-    mkdir "$TEMP_DIR/extracted"
-    ditto -x -k "$TEMP_DIR/$ASSET_NAME" "$TEMP_DIR/extracted"
-    NEW_BUNDLE="$TEMP_DIR/extracted/Minime.app"
-    [ -d "$NEW_BUNDLE" ] || fail "the archive does not contain Minime.app"
+    hdiutil verify "$DOWNLOADED_PATH" >/dev/null
+    spctl \
+      --assess \
+      --type open \
+      --context context:primary-signature \
+      --verbose=4 \
+      "$DOWNLOADED_PATH"
+
+    DMG_MOUNT="$TEMP_DIR/mounted-dmg"
+    mkdir -p "$DMG_MOUNT" "$TEMP_DIR/staged"
+    hdiutil attach \
+      "$DOWNLOADED_PATH" \
+      -mountpoint "$DMG_MOUNT" \
+      -readonly \
+      -nobrowse \
+      -noautoopen >/dev/null
+
+    [ -d "$DMG_MOUNT/Minime.app" ] \
+      || fail "the DMG does not contain Minime.app"
+    ditto "$DMG_MOUNT/Minime.app" "$TEMP_DIR/staged/Minime.app"
+    hdiutil detach "$DMG_MOUNT" -quiet
+    DMG_MOUNT=""
+
+    NEW_BUNDLE="$TEMP_DIR/staged/Minime.app"
+    actual_arches="$(lipo -archs "$NEW_BUNDLE/Contents/MacOS/minime")"
+    [ "$actual_arches" = "$BINARY_ARCH" ] \
+      || fail "the update contains the wrong processor architecture"
 
     codesign --verify --deep --strict --verbose=2 "$NEW_BUNDLE"
     SIGNATURE_DETAILS="$(codesign --display --verbose=4 "$NEW_BUNDLE" 2>&1)"
@@ -70,25 +127,45 @@ case "$(uname -s)" in
     spctl --assess --type execute --verbose=4 "$NEW_BUNDLE"
 
     mv "$APP_BUNDLE" "$BACKUP_BUNDLE"
-    if ! mv "$NEW_BUNDLE" "$APP_BUNDLE"; then
+    if ! ditto "$NEW_BUNDLE" "$APP_BUNDLE"; then
+      rm -rf "$APP_BUNDLE"
       mv "$BACKUP_BUNDLE" "$APP_BUNDLE"
       fail "the new application could not be installed"
     fi
     ;;
 
   Linux)
-    ASSET_NAME="Minime-${VERSION}-linux.tar.gz"
-    EXPECTED_SHA="__LINUX_SHA256__"
+    [ -z "${FLATPAK_ID:-}" ] \
+      || fail "this copy is managed by Flatpak; install updates through its configured Flatpak source"
+
+    case "$machine" in
+      x86_64 | amd64)
+        RELEASE_ARCH="x64"
+        EXPECTED_SHA="__LINUX_X64_SHA256__"
+        ;;
+      aarch64 | arm64)
+        RELEASE_ARCH="arm64"
+        EXPECTED_SHA="__LINUX_ARM64_SHA256__"
+        ;;
+      *)
+        fail "unsupported Linux architecture: $machine"
+        ;;
+    esac
+
+    ASSET_NAME="Minime-${VERSION}-linux-${RELEASE_ARCH}.tar.gz"
     CURRENT_BINARY="$INSTALL_DIR/minime"
     BACKUP_BINARY="${CURRENT_BINARY}.minime-backup"
-    [ -x "$CURRENT_BINARY" ] || fail "the installed Minime executable was not found"
-    [ ! -e "$BACKUP_BINARY" ] || fail "a previous update backup still exists"
+    [ -x "$CURRENT_BINARY" ] \
+      || fail "the installed Minime executable was not found"
+    [ ! -e "$BACKUP_BINARY" ] \
+      || fail "a previous update backup still exists"
 
     download_and_verify "$ASSET_NAME" "$EXPECTED_SHA"
     mkdir "$TEMP_DIR/extracted"
-    tar -xzf "$TEMP_DIR/$ASSET_NAME" -C "$TEMP_DIR/extracted"
+    tar -xzf "$DOWNLOADED_PATH" -C "$TEMP_DIR/extracted"
     NEW_BINARY="$TEMP_DIR/extracted/minime"
-    [ -f "$NEW_BINARY" ] || fail "the archive does not contain the Minime executable"
+    [ -f "$NEW_BINARY" ] \
+      || fail "the archive does not contain the Minime executable"
 
     mv "$CURRENT_BINARY" "$BACKUP_BINARY"
     if ! install -m 755 "$NEW_BINARY" "$CURRENT_BINARY"; then

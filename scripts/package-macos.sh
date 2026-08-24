@@ -65,6 +65,13 @@ mkdir -p "$staged_bundle/Contents/MacOS" "$staged_bundle/Contents/Resources"
 cp "$binary_path" "$staged_bundle/Contents/MacOS/minime"
 cp "$project_dir/packaging/macos/Info.plist" "$staged_bundle/Contents/Info.plist"
 cp "$project_dir/assets/minime.svg" "$staged_bundle/Contents/Resources/minime.svg"
+sips \
+  -s format png \
+  -z 840 1320 \
+  -s dpiWidth 144 \
+  -s dpiHeight 144 \
+  "$project_dir/packaging/macos/dmg-background.svg" \
+  --out "$staged_bundle/Contents/Resources/MinimeDmgBackground.png" >/dev/null
 chmod +x "$staged_bundle/Contents/MacOS/minime"
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$staged_bundle/Contents/Info.plist"
