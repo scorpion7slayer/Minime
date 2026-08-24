@@ -1,0 +1,2 @@
+# Minime
+image compression application
