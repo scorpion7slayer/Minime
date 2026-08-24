@@ -1,0 +1,43 @@
+$ErrorActionPreference = "Stop"
+
+$Version = "__VERSION__"
+$AssetName = "Minime-$Version-windows.zip"
+$ExpectedSha256 = "__WINDOWS_SHA256__"
+$ReleaseRoot = "https://github.com/scorpion7slayer/Minime/releases/download/v$Version"
+$InstallDir = if ($env:CARGO_DIST_FORCE_INSTALL_DIR) {
+    $env:CARGO_DIST_FORCE_INSTALL_DIR
+} else {
+    $env:MINIME_INSTALL_DIR
+}
+
+if (-not $InstallDir -or -not (Test-Path -LiteralPath $InstallDir -PathType Container)) {
+    throw "Minime update failed: the install directory is missing"
+}
+
+$TempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("minime-update-" + [guid]::NewGuid())
+$ArchivePath = Join-Path $TempDir $AssetName
+$ExtractedPath = Join-Path $TempDir "extracted"
+
+try {
+    New-Item -ItemType Directory -Path $TempDir | Out-Null
+    Invoke-WebRequest -Uri "$ReleaseRoot/$AssetName" -OutFile $ArchivePath
+
+    $ActualSha256 = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($ActualSha256 -ne $ExpectedSha256.ToLowerInvariant()) {
+        throw "Minime update failed: the downloaded archive checksum does not match"
+    }
+
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractedPath
+    $NewExecutable = Join-Path $ExtractedPath "minime.exe"
+    $Destination = Join-Path $InstallDir "minime.exe"
+    if (-not (Test-Path -LiteralPath $NewExecutable -PathType Leaf)) {
+        throw "Minime update failed: the archive does not contain minime.exe"
+    }
+
+    Copy-Item -LiteralPath $NewExecutable -Destination $Destination -Force
+    Write-Output "Minime $Version is installed."
+} finally {
+    if (Test-Path -LiteralPath $TempDir) {
+        Remove-Item -LiteralPath $TempDir -Recurse -Force
+    }
+}

@@ -1,7 +1,13 @@
 mod localization;
 mod preferences;
+mod updater;
 
-use std::{borrow::Cow, collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    path::PathBuf,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Result;
 use gpui::{
@@ -21,6 +27,7 @@ use rfd::FileDialog;
 use crate::{
     localization::Language,
     preferences::{Preferences, ThemePreference},
+    updater::{InstallOutcome, UpdateCheck},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +79,7 @@ const OPEN_ICON: &str = "arrow-up-right.svg";
 const SETTINGS_ICON: &str = "settings.svg";
 const COFFEE_ICON: &str = "coffee.svg";
 const INFO_ICON: &str = "info.svg";
+const UPDATE_ICON: &str = "refresh.svg";
 
 const SUPPORT_URL: &str = "https://buymeacoffee.com/scorpion7slayer";
 const DEVELOPMENT_APP_ID: &str = "dev.minime.app";
@@ -106,6 +114,7 @@ impl AssetSource for Assets {
             SETTINGS_ICON => include_bytes!("../assets/settings.svg"),
             COFFEE_ICON => include_bytes!("../assets/coffee.svg"),
             INFO_ICON => include_bytes!("../assets/info.svg"),
+            UPDATE_ICON => include_bytes!("../assets/refresh.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(bytes)))
@@ -125,6 +134,7 @@ impl AssetSource for Assets {
             SETTINGS_ICON,
             COFFEE_ICON,
             INFO_ICON,
+            UPDATE_ICON,
         ]
         .into_iter()
         .map(SharedString::from)
@@ -135,6 +145,7 @@ impl AssetSource for Assets {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppView {
     Introduction,
+    UpdateConsent,
     Workspace,
     Settings,
 }
@@ -149,6 +160,7 @@ enum PreviewVersion {
 enum PreferenceToggle {
     Preview,
     RevealAfterCompression,
+    AutomaticUpdateChecks,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,6 +172,10 @@ enum ButtonMotion {
     Compress,
     Preference(usize),
     IntroStart,
+    UpdateConsentAutomatic,
+    UpdateConsentManual,
+    UpdateCheck,
+    UpdateInstall,
     Support,
 }
 
@@ -173,6 +189,10 @@ impl ButtonMotion {
             Self::Compress => "compress".into(),
             Self::Preference(index) => format!("preference-{index}"),
             Self::IntroStart => "intro-start".into(),
+            Self::UpdateConsentAutomatic => "update-consent-automatic".into(),
+            Self::UpdateConsentManual => "update-consent-manual".into(),
+            Self::UpdateCheck => "update-check".into(),
+            Self::UpdateInstall => "update-install".into(),
             Self::Support => "support".into(),
         }
     }
@@ -207,6 +227,25 @@ struct SelectionMotion {
     epoch: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateStatus {
+    Idle,
+    Checking,
+    UpToDate,
+    DevelopmentBuild,
+    Available { version: String },
+    Installing { version: String },
+    CheckFailed,
+    InstallFailed,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn dark_mode_for(theme: ThemePreference, appearance: WindowAppearance) -> bool {
     match theme {
         ThemePreference::System => matches!(
@@ -232,6 +271,10 @@ struct MinimeApp {
     show_preview: bool,
     reveal_after_compression: bool,
     intro_seen: bool,
+    automatic_update_checks: Option<bool>,
+    last_update_check_unix: Option<u64>,
+    startup_update_check_started: bool,
+    update_status: UpdateStatus,
     view: AppView,
     selected_index: usize,
     preview_version: PreviewVersion,
@@ -252,10 +295,12 @@ impl MinimeApp {
             window.observe_window_appearance(|window, _| window.refresh());
         let preferences = Preferences::load();
         let dark_mode = dark_mode_for(preferences.theme, window.appearance());
-        let view = if preferences.intro_seen {
-            AppView::Workspace
-        } else {
+        let view = if !preferences.intro_seen {
             AppView::Introduction
+        } else if preferences.automatic_update_checks.is_none() {
+            AppView::UpdateConsent
+        } else {
+            AppView::Workspace
         };
         Self {
             _appearance_subscription: appearance_subscription,
@@ -271,6 +316,10 @@ impl MinimeApp {
             show_preview: preferences.show_preview,
             reveal_after_compression: preferences.reveal_after_compression,
             intro_seen: preferences.intro_seen,
+            automatic_update_checks: preferences.automatic_update_checks,
+            last_update_check_unix: preferences.last_update_check_unix,
+            startup_update_check_started: false,
+            update_status: UpdateStatus::Idle,
             view,
             selected_index: 0,
             preview_version: PreviewVersion::Original,
@@ -299,6 +348,8 @@ impl MinimeApp {
             show_preview: self.show_preview,
             reveal_after_compression: self.reveal_after_compression,
             intro_seen: self.intro_seen,
+            automatic_update_checks: self.automatic_update_checks,
+            last_update_check_unix: self.last_update_check_unix,
         };
         if let Err(error) = preferences.save() {
             log::warn!("Unable to save Minime preferences: {error}");
@@ -356,9 +407,127 @@ impl MinimeApp {
 
     fn finish_introduction(&mut self, cx: &mut Context<Self>) {
         self.intro_seen = true;
-        self.view = AppView::Workspace;
+        self.view = if self.automatic_update_checks.is_none() {
+            AppView::UpdateConsent
+        } else {
+            AppView::Workspace
+        };
         self.persist_preferences();
         cx.notify();
+    }
+
+    fn choose_update_checks(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.automatic_update_checks = Some(enabled);
+        self.view = AppView::Workspace;
+        self.persist_preferences();
+        if enabled {
+            self.startup_update_check_started = true;
+            self.start_update_check(false, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn set_automatic_update_checks(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.automatic_update_checks = Some(enabled);
+        self.persist_preferences();
+        if enabled && updater::should_check_automatically(self.last_update_check_unix, unix_now()) {
+            self.startup_update_check_started = true;
+            self.start_update_check(false, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn maybe_start_automatic_update_check(&mut self, cx: &mut Context<Self>) {
+        if self.view != AppView::Workspace
+            || self.automatic_update_checks != Some(true)
+            || self.startup_update_check_started
+        {
+            return;
+        }
+        self.startup_update_check_started = true;
+        let now = unix_now();
+        if updater::should_check_automatically(self.last_update_check_unix, now) {
+            self.start_update_check(false, cx);
+        }
+    }
+
+    fn start_update_check(&mut self, _manual: bool, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Installing { .. }
+        ) {
+            return;
+        }
+
+        self.update_status = UpdateStatus::Checking;
+        self.last_update_check_unix = Some(unix_now());
+        self.persist_preferences();
+        cx.notify();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { updater::check_for_update() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.update_status = match result {
+                    Ok(UpdateCheck::DevelopmentBuild) => UpdateStatus::DevelopmentBuild,
+                    Ok(UpdateCheck::UpToDate) => UpdateStatus::UpToDate,
+                    Ok(UpdateCheck::Available { version }) => UpdateStatus::Available { version },
+                    Err(error) => {
+                        log::warn!("Unable to check for a Minime update: {error:#}");
+                        UpdateStatus::CheckFailed
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let UpdateStatus::Available { version } = &self.update_status else {
+            return;
+        };
+        let version = version.clone();
+        self.update_status = UpdateStatus::Installing {
+            version: version.clone(),
+        };
+        cx.notify();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { updater::install_update() });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(InstallOutcome::UpToDate) => {
+                    this.update_status = UpdateStatus::UpToDate;
+                    cx.notify();
+                }
+                Ok(InstallOutcome::Updated {
+                    version,
+                    restart_target,
+                }) => match updater::restart_application(&restart_target) {
+                    Ok(()) => cx.quit(),
+                    Err(error) => {
+                        log::warn!("Unable to restart Minime {version}: {error:#}");
+                        this.update_status = UpdateStatus::InstallFailed;
+                        cx.notify();
+                    }
+                },
+                Err(error) => {
+                    log::warn!("Unable to install the Minime update: {error:#}");
+                    this.update_status = UpdateStatus::InstallFailed;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn open_introduction(&mut self, cx: &mut Context<Self>) {
@@ -2324,6 +2493,7 @@ impl MinimeApp {
         let motion_index = match preference {
             PreferenceToggle::Preview => 0,
             PreferenceToggle::RevealAfterCompression => 1,
+            PreferenceToggle::AutomaticUpdateChecks => 3,
         };
         let motion = ButtonMotion::Preference(motion_index);
         div()
@@ -2339,6 +2509,11 @@ impl MinimeApp {
                     PreferenceToggle::Preview => this.show_preview = !this.show_preview,
                     PreferenceToggle::RevealAfterCompression => {
                         this.reveal_after_compression = !this.reveal_after_compression;
+                    }
+                    PreferenceToggle::AutomaticUpdateChecks => {
+                        let enabled = this.automatic_update_checks != Some(true);
+                        this.set_automatic_update_checks(enabled, cx);
+                        return;
                     }
                 }
                 this.persist_preferences();
@@ -2599,6 +2774,431 @@ impl MinimeApp {
             .into_any_element()
     }
 
+    fn render_update_consent(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rgb = self.rgb();
+        div()
+            .size_full()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(img(Self::logo_source()).size_9())
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Minime"),
+                            ),
+                    )
+                    .child(self.render_language_picker(cx)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_6()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(SURFACE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(520.0))
+                            .max_w_full()
+                            .child(
+                                div()
+                                    .size_10()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .bg(rgb(BLUE_WASH))
+                                    .child(self.icon(UPDATE_ICON, 18.0, BLUE_INK)),
+                            )
+                            .child(
+                                div()
+                                    .mt_4()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .line_height(relative(1.12))
+                                    .child(self.text(
+                                        "Comment souhaitez-vous recevoir les mises à jour ?",
+                                        "How should Minime check for updates?",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .text_sm()
+                                    .line_height(relative(1.55))
+                                    .text_color(rgb(MUTED))
+                                    .child(self.text(
+                                        "Minime peut interroger GitHub au démarrage, au maximum une fois par jour. Aucun téléchargement ni aucune installation ne commence sans votre accord.",
+                                        "Minime can ask GitHub when it opens, at most once a day. Nothing is downloaded or installed without your approval.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .p_3()
+                                    .rounded_md()
+                                    .bg(rgb(CONTROL_BG))
+                                    .text_xs()
+                                    .line_height(relative(1.5))
+                                    .text_color(rgb(MUTED))
+                                    .child(self.text(
+                                        "La requête contient la version de Minime et les données réseau habituelles. Vos images et leurs noms ne quittent jamais l’appareil.",
+                                        "The request includes Minime’s version and ordinary network data. Your images and file names never leave this device.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_5()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(self.animate_button(
+                                        div()
+                                            .id("enable-automatic-update-checks")
+                                            .h_10()
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .rounded_md()
+                                            .bg(rgb(PRIMARY_BG))
+                                            .text_color(rgb(PRIMARY_FG))
+                                            .text_sm()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(PRIMARY_HOVER)))
+                                            .active(|style| style.opacity(0.82))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.trigger_button_motion(
+                                                    ButtonMotion::UpdateConsentAutomatic,
+                                                    cx,
+                                                );
+                                                this.choose_update_checks(true, cx);
+                                            }))
+                                            .child(self.animated_button_icon(
+                                                UPDATE_ICON,
+                                                16.0,
+                                                PRIMARY_FG,
+                                                ButtonMotion::UpdateConsentAutomatic,
+                                            ))
+                                            .child(self.text(
+                                                "Vérifier automatiquement",
+                                                "Check automatically",
+                                            )),
+                                        ButtonMotion::UpdateConsentAutomatic,
+                                    ))
+                                    .child(self.animate_button(
+                                        div()
+                                            .id("manual-update-checks-only")
+                                            .h_10()
+                                            .px_3()
+                                            .flex()
+                                            .items_center()
+                                            .rounded_md()
+                                            .bg(rgb(CONTROL_BG))
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .cursor_pointer()
+                                            .hover(|style| style.bg(rgb(HOVER_BG)))
+                                            .active(|style| style.opacity(0.82))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.trigger_button_motion(
+                                                    ButtonMotion::UpdateConsentManual,
+                                                    cx,
+                                                );
+                                                this.choose_update_checks(false, cx);
+                                            }))
+                                            .child(self.text(
+                                                "Seulement quand je le demande",
+                                                "Only when I ask",
+                                            )),
+                                        ButtonMotion::UpdateConsentManual,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .mt_3()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(self.text(
+                                        "Ce choix reste modifiable dans les paramètres.",
+                                        "You can change this later in Settings.",
+                                    )),
+                            ),
+                    ),
+            )
+            .with_animation(
+                "update-consent-enter",
+                Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
+                |consent, delta| consent.opacity(delta),
+            )
+            .into_any_element()
+    }
+
+    fn update_status_text(&self) -> String {
+        match &self.update_status {
+            UpdateStatus::Idle => format!(
+                "{} {}",
+                self.text("Version installée", "Installed version"),
+                env!("CARGO_PKG_VERSION")
+            ),
+            UpdateStatus::Checking => self.text("Vérification…", "Checking…").into(),
+            UpdateStatus::UpToDate => format!(
+                "{} {} {}",
+                self.text("Minime", "Minime"),
+                env!("CARGO_PKG_VERSION"),
+                self.text("est à jour.", "is up to date.")
+            ),
+            UpdateStatus::DevelopmentBuild => self
+                .text(
+                    "La vérification est disponible dans les versions officielles.",
+                    "Update checks are available in official builds.",
+                )
+                .into(),
+            UpdateStatus::Available { version } => {
+                format!(
+                    "{} {version} {}",
+                    self.text("Minime", "Minime"),
+                    self.text("est disponible.", "is available.")
+                )
+            }
+            UpdateStatus::Installing { version } => format!(
+                "{} {version}…",
+                self.text("Installation de Minime", "Installing Minime")
+            ),
+            UpdateStatus::CheckFailed => self
+                .text(
+                    "Impossible de vérifier pour le moment. Réessayez plus tard.",
+                    "Minime couldn’t check right now. Try again later.",
+                )
+                .into(),
+            UpdateStatus::InstallFailed => self
+                .text(
+                    "L’installation a échoué. Votre version actuelle n’a pas été remplacée.",
+                    "The update couldn’t be installed. Your current copy was left in place.",
+                )
+                .into(),
+        }
+    }
+
+    fn render_update_action(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rgb = self.rgb();
+        let installing = matches!(self.update_status, UpdateStatus::Installing { .. });
+        let checking = self.update_status == UpdateStatus::Checking;
+        let install = matches!(self.update_status, UpdateStatus::Available { .. });
+        let disabled = installing || checking;
+        let motion = if install {
+            ButtonMotion::UpdateInstall
+        } else {
+            ButtonMotion::UpdateCheck
+        };
+        let label = match &self.update_status {
+            UpdateStatus::Available { version } => {
+                format!("{} {version}", self.text("Installer", "Install"))
+            }
+            UpdateStatus::Installing { .. } => self.text("Installation…", "Installing…").into(),
+            UpdateStatus::Checking => self.text("Vérification…", "Checking…").into(),
+            _ => self.text("Vérifier maintenant", "Check now").into(),
+        };
+
+        self.animate_button(
+            div()
+                .id("check-for-updates")
+                .h_10()
+                .px_3()
+                .flex()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .bg(if install {
+                    rgb(PRIMARY_BG)
+                } else {
+                    rgb(CONTROL_BG)
+                })
+                .text_color(if install {
+                    rgb(PRIMARY_FG)
+                } else if disabled {
+                    rgb(DISABLED_FG)
+                } else {
+                    rgb(INK)
+                })
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .when(!disabled, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|style| {
+                            style.bg(if install {
+                                rgb(PRIMARY_HOVER)
+                            } else {
+                                rgb(HOVER_BG)
+                            })
+                        })
+                        .active(|style| style.opacity(0.82))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.trigger_button_motion(motion, cx);
+                            if install {
+                                this.install_update(cx);
+                            } else {
+                                this.start_update_check(true, cx);
+                            }
+                        }))
+                })
+                .child(self.animated_button_icon(
+                    UPDATE_ICON,
+                    16.0,
+                    if install { PRIMARY_FG } else { MUTED },
+                    motion,
+                ))
+                .child(label),
+            motion,
+        )
+    }
+
+    fn render_update_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+        let rgb = self.rgb();
+        div()
+            .pt_2()
+            .border_t_1()
+            .border_color(rgb(DIVIDER))
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.render_preference_toggle(
+                        "settings-automatic-updates",
+                        self.text(
+                            "Vérifier les mises à jour automatiquement",
+                            "Check for updates automatically",
+                        ),
+                        self.text(
+                            "Au démarrage, au maximum une fois par jour. L’installation demande toujours votre accord.",
+                            "At startup, at most once a day. Installation always asks first.",
+                        ),
+                        self.automatic_update_checks == Some(true),
+                        PreferenceToggle::AutomaticUpdateChecks,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .ml(px(30.0))
+                            .mt(px(-4.0))
+                            .text_xs()
+                            .text_color(match self.update_status {
+                                UpdateStatus::Available { .. } | UpdateStatus::UpToDate => {
+                                    rgb(GREEN_INK)
+                                }
+                                UpdateStatus::CheckFailed | UpdateStatus::InstallFailed => {
+                                    rgb(RED_INK)
+                                }
+                                _ => rgb(MUTED),
+                            })
+                            .child(self.update_status_text()),
+                    ),
+            )
+            .child(self.render_update_action(cx))
+            .into_any_element()
+    }
+
+    fn render_update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let rgb = self.rgb();
+        let version = match &self.update_status {
+            UpdateStatus::Available { version } | UpdateStatus::Installing { version } => {
+                version.clone()
+            }
+            _ => return None,
+        };
+        let installing = matches!(self.update_status, UpdateStatus::Installing { .. });
+
+        Some(
+            div()
+                .h_11()
+                .px_3()
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded_md()
+                .bg(rgb(BLUE_WASH))
+                .text_color(rgb(BLUE_INK))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(self.icon(UPDATE_ICON, 16.0, BLUE_INK))
+                        .child(div().text_sm().font_weight(FontWeight::MEDIUM).child(
+                            if installing {
+                                format!(
+                                    "{} {version}…",
+                                    self.text("Installation de Minime", "Installing Minime")
+                                )
+                            } else {
+                                format!(
+                                    "{} {version} {}",
+                                    self.text("Minime", "Minime"),
+                                    self.text("est prêt.", "is ready.")
+                                )
+                            },
+                        )),
+                )
+                .when(!installing, |banner| {
+                    banner.child(
+                        self.animate_button(
+                            div()
+                                .id("install-update-banner")
+                                .h_8()
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .bg(rgb(PRIMARY_BG))
+                                .text_color(rgb(PRIMARY_FG))
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(PRIMARY_HOVER)))
+                                .active(|style| style.opacity(0.82))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.trigger_button_motion(ButtonMotion::UpdateInstall, cx);
+                                    this.install_update(cx);
+                                }))
+                                .child(self.text("Installer et relancer", "Install and restart")),
+                            ButtonMotion::UpdateInstall,
+                        ),
+                    )
+                })
+                .with_animation(
+                    "update-banner-enter",
+                    Animation::new(Duration::from_millis(180)).with_easing(ease_out_quint()),
+                    |banner, delta| banner.opacity(delta),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let rgb = self.rgb();
         div()
@@ -2659,14 +3259,14 @@ impl MinimeApp {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .p_4()
+                    .p_3()
                     .rounded_xl()
                     .border_1()
                     .border_color(rgb(BORDER))
                     .bg(rgb(SURFACE))
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
                             .child(
@@ -2776,10 +3376,11 @@ impl MinimeApp {
                                     ),
                             ),
                     )
+                    .child(self.render_update_settings(cx))
                     .child(
                         div()
                             .mt_auto()
-                            .pt_3()
+                            .pt_2()
                             .border_t_1()
                             .border_color(rgb(DIVIDER))
                             .flex()
@@ -2810,7 +3411,7 @@ impl MinimeApp {
                             .child(self.animate_button(
                                 div()
                                     .id("buy-me-a-coffee")
-                                    .h_10()
+                                    .h_9()
                                     .px_3()
                                     .flex()
                                     .items_center()
@@ -2855,6 +3456,9 @@ impl MinimeApp {
             .flex_col()
             .gap_3()
             .child(self.render_header(cx))
+            .when_some(self.render_update_banner(cx), |workspace, banner| {
+                workspace.child(banner)
+            })
             .child(self.render_content(narrow, cx))
             .child(self.render_controls(narrow, cx))
             .when_some(self.notice.clone(), |this, notice| {
@@ -2887,10 +3491,12 @@ impl MinimeApp {
 impl Render for MinimeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dark_mode = dark_mode_for(self.theme, window.appearance());
+        self.maybe_start_automatic_update_check(cx);
         let rgb = self.rgb();
         let narrow = f32::from(window.viewport_size().width) < 700.0;
         let page = match self.view {
             AppView::Introduction => self.render_introduction(cx),
+            AppView::UpdateConsent => self.render_update_consent(cx),
             AppView::Workspace => self.render_workspace(narrow, cx),
             AppView::Settings => self.render_settings(cx),
         };
@@ -2932,6 +3538,7 @@ fn install_dock_icon() {
 
 fn main() {
     env_logger::init();
+    updater::cleanup_update_backup();
 
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         #[cfg(target_os = "macos")]

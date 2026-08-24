@@ -160,11 +160,50 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           pattern: Minime-v*-*
           merge-multiple: true
           path: release-assets
+
+      - name: Build the in-app update installers
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          macos_asset="release-assets/Minime-${version}-macos.zip"
+          windows_asset="release-assets/Minime-${version}-windows.zip"
+          linux_asset="release-assets/Minime-${version}-linux.tar.gz"
+
+          macos_sha="$(sha256sum "$macos_asset" | cut -d ' ' -f 1)"
+          windows_sha="$(sha256sum "$windows_asset" | cut -d ' ' -f 1)"
+          linux_sha="$(sha256sum "$linux_asset" | cut -d ' ' -f 1)"
+
+          sed \
+            -e "s/__VERSION__/$version/g" \
+            -e "s/__MACOS_SHA256__/$macos_sha/g" \
+            -e "s/__LINUX_SHA256__/$linux_sha/g" \
+            packaging/update/minime-installer.sh.in \
+            > release-assets/minime-installer.sh
+          chmod +x release-assets/minime-installer.sh
+
+          sed \
+            -e "s/__VERSION__/$version/g" \
+            -e "s/__WINDOWS_SHA256__/$windows_sha/g" \
+            packaging/update/minime-installer.ps1.in \
+            > release-assets/minime-installer.ps1
+
+          (
+            cd release-assets
+            sha256sum \
+              "Minime-${version}-macos.zip" \
+              "Minime-${version}-windows.zip" \
+              "Minime-${version}-linux.tar.gz" \
+              minime-installer.sh \
+              minime-installer.ps1 \
+              > SHA256SUMS
+          )
 
       - name: Create or update the GitHub Release
         env:

@@ -55,6 +55,8 @@ pub struct Preferences {
     pub show_preview: bool,
     pub reveal_after_compression: bool,
     pub intro_seen: bool,
+    pub automatic_update_checks: Option<bool>,
+    pub last_update_check_unix: Option<u64>,
 }
 
 impl Default for Preferences {
@@ -69,6 +71,8 @@ impl Default for Preferences {
             show_preview: true,
             reveal_after_compression: false,
             intro_seen: false,
+            automatic_update_checks: None,
+            last_update_check_unix: None,
         }
     }
 }
@@ -100,8 +104,17 @@ impl Preferences {
             .as_ref()
             .map(|path| path.to_string_lossy().replace(['\r', '\n'], ""))
             .unwrap_or_default();
+        let automatic_update_checks = match self.automatic_update_checks {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "ask",
+        };
+        let last_update_check_unix = self
+            .last_update_check_unix
+            .map(|timestamp| timestamp.to_string())
+            .unwrap_or_default();
         format!(
-            "version=2\nlanguage={}\ntheme={}\noutput_format={}\noutput_dir={}\nreject_larger={}\neffort={}\nshow_preview={}\nreveal_after_compression={}\nintro_seen={}\n",
+            "version=3\nlanguage={}\ntheme={}\noutput_format={}\noutput_dir={}\nreject_larger={}\neffort={}\nshow_preview={}\nreveal_after_compression={}\nintro_seen={}\nautomatic_update_checks={}\nlast_update_check_unix={}\n",
             self.language.id(),
             self.theme.id(),
             self.output_format.id(),
@@ -111,6 +124,8 @@ impl Preferences {
             self.show_preview,
             self.reveal_after_compression,
             self.intro_seen,
+            automatic_update_checks,
+            last_update_check_unix,
         )
     }
 
@@ -150,6 +165,16 @@ impl Preferences {
                     preferences.reveal_after_compression = value == "true";
                 }
                 "intro_seen" => preferences.intro_seen = value == "true",
+                "automatic_update_checks" => {
+                    preferences.automatic_update_checks = match value {
+                        "true" => Some(true),
+                        "false" => Some(false),
+                        _ => None,
+                    };
+                }
+                "last_update_check_unix" => {
+                    preferences.last_update_check_unix = value.parse().ok();
+                }
                 _ => {}
             }
         }
@@ -208,6 +233,8 @@ mod tests {
             show_preview: false,
             reveal_after_compression: true,
             intro_seen: true,
+            automatic_update_checks: Some(true),
+            last_update_check_unix: Some(1_725_000_000),
         };
 
         assert_eq!(Preferences::decode(&preferences.encode()), preferences);
@@ -224,6 +251,7 @@ mod tests {
         assert_eq!(preferences.effort, CompressionEffort::Balanced);
         assert_eq!(preferences.theme, ThemePreference::System);
         assert!(preferences.reject_larger);
+        assert_eq!(preferences.automatic_update_checks, None);
     }
 
     #[test]
@@ -233,6 +261,7 @@ mod tests {
         assert_eq!(preferences.language, Language::English);
         assert_eq!(preferences.theme, ThemePreference::System);
         assert!(preferences.intro_seen);
+        assert_eq!(preferences.automatic_update_checks, None);
     }
 
     #[test]
@@ -242,5 +271,20 @@ mod tests {
             Preferences::decode("version=2\n").language,
             Language::English
         );
+    }
+
+    #[test]
+    fn update_consent_is_preserved_and_invalid_timestamps_are_ignored() {
+        let enabled = Preferences::decode(
+            "version=3\nautomatic_update_checks=true\nlast_update_check_unix=1725000000\n",
+        );
+        assert_eq!(enabled.automatic_update_checks, Some(true));
+        assert_eq!(enabled.last_update_check_unix, Some(1_725_000_000));
+
+        let manual = Preferences::decode(
+            "version=3\nautomatic_update_checks=false\nlast_update_check_unix=not-a-number\n",
+        );
+        assert_eq!(manual.automatic_update_checks, Some(false));
+        assert_eq!(manual.last_update_check_unix, None);
     }
 }

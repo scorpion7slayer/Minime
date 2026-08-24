@@ -9,6 +9,7 @@ rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0"
+axoupdater = { version = "0.10.2", features = ["blocking"] }
 env_logger = "0.11"
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 image = { version = "0.25.10", default-features = false, features = [
@@ -27,8 +28,10 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 log = "0.4"
 oxipng = { version = "10.2", default-features = false, features = ["parallel"] }
+reqwest = "0.13"
 rfd = "0.17"
 tempfile = "3.23"
+tokio = { version = "1.48", features = ["rt"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

@@ -2,7 +2,7 @@
 
 Minime is a desktop image compressor and format converter written in Rust with [GPUI](https://gpui.rs/). It reduces file size or creates a pixel-exact copy in another format without sending the image anywhere.
 
-Everything runs locally. Minime does not upload images, metadata, or usage statistics.
+Image processing always runs locally. Minime never uploads images, file names, metadata, or usage statistics. If the user enables automatic update checks or presses **Check now**, Minime contacts the public GitHub Releases API with its current version and a standard HTTP user agent.
 
 ## Features
 
@@ -10,6 +10,7 @@ Everything runs locally. Minime does not upload images, metadata, or usage stati
 - process several images in one batch without blocking the interface;
 - use English by default or switch to French;
 - follow the system theme or force light or dark mode;
+- opt into a daily update check, check manually, and install a release without opening a browser;
 - compare the original image with the generated result;
 - inspect the format, dimensions, file size, and saved space;
 - use `Auto` to find the smallest exact image representation;
@@ -241,9 +242,19 @@ spctl --assess --type execute --verbose=4 dist/Minime.app
 
 Test the final ZIP on another Mac account or machine after downloading it through a browser. That exercises Gatekeeper and quarantine behavior more realistically than opening the build directly from `dist/`.
 
+## In-app updates
+
+After the quick tour, Minime asks whether it may check for updates automatically. Declining leaves update checks fully manual. When enabled, Minime checks at startup at most once every 24 hours; downloading and installing an update always requires a separate click.
+
+Updates are read from the latest stable release in `scorpion7slayer/Minime`. This repository must be public before shipping an updater-enabled build. Do not embed a GitHub token in the application to access private releases.
+
+The release workflow publishes `minime-installer.sh` for macOS and Linux and `minime-installer.ps1` for Windows. Each installer verifies the SHA-256 digest embedded at release time before replacing anything. The macOS installer additionally verifies the Developer ID signature, Apple Team ID, official bundle identifier, and Gatekeeper assessment, then replaces the complete `.app` bundle so its signature stays valid. A previous copy is kept until the updated application starts successfully.
+
+Minime does not silently install updates. If the installed folder is read-only, the installer fails without replacing the current copy. On macOS, move `Minime.app` out of a translocated download location and into `/Applications` before updating.
+
 ## Configure signed GitHub releases
 
-The release workflow imports the Developer ID certificate into a temporary keychain, signs Minime, notarizes it, staples the ticket, builds Windows and Linux archives, and publishes all three archives to [GitHub Releases](https://github.com/scorpion7slayer/Minime/releases).
+The release workflow imports the Developer ID certificate into a temporary keychain, signs Minime, notarizes it, staples the ticket, builds Windows and Linux archives, generates the platform update installers and `SHA256SUMS`, and publishes them to [GitHub Releases](https://github.com/scorpion7slayer/Minime/releases).
 
 Add these repository secrets under **Settings → Secrets and variables → Actions**:
 
@@ -313,9 +324,11 @@ The tests cover exact QOI, TIFF, BMP, and Farbfeld outputs, PNG size reduction, 
 ## Project layout
 
 - `src/compression.rs`: decoding, orientation, encoders, PNG optimization, exact verification, and atomic writes;
-- `src/main.rs`: GPUI interface, introduction, preview, settings, drag and drop, and asynchronous processing;
+- `src/main.rs`: GPUI interface, introduction, update consent, preview, settings, drag and drop, and asynchronous processing;
+- `src/updater.rs`: release checks, bounded network access, platform-aware installation, restart, and rollback cleanup;
 - `src/localization.rs` and `src/preferences.rs`: English/French copy and cross-platform preferences;
 - `packaging/macos/Info.plist`: development plist template updated by the packaging script;
+- `packaging/update`: checksum-verifying macOS/Linux and Windows installer templates;
 - `scripts/package-macos.sh`: development or Developer ID-signed macOS bundle;
 - `scripts/notarize-macos.sh`: notarization, stapling, Gatekeeper validation, and final ZIP;
 - `.github/workflows/ci.yml`: macOS, Windows, and Linux validation;
