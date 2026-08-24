@@ -74,6 +74,11 @@ const COFFEE_ICON: &str = "coffee.svg";
 const INFO_ICON: &str = "info.svg";
 
 const SUPPORT_URL: &str = "https://buymeacoffee.com/scorpion7slayer";
+const DEVELOPMENT_APP_ID: &str = "dev.minime.app";
+
+fn application_id() -> &'static str {
+    option_env!("MINIME_APP_ID").unwrap_or(DEVELOPMENT_APP_ID)
+}
 
 actions!(minime, [OpenFiles, CompressNow, ClearQueue]);
 
@@ -2950,7 +2955,7 @@ fn main() {
                 }),
                 window_background: WindowBackgroundAppearance::Opaque,
                 window_min_size: Some(size(px(620.0), px(500.0))),
-                app_id: Some("dev.minime.app".into()),
+                app_id: Some(application_id().into()),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| MinimeApp::new(window, cx)),

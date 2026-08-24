@@ -8,6 +8,13 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OFFICIAL_BUNDLE_ID: io.github.scorpion7slayer.minime
+
 jobs:
   build:
     name: Build ${{ matrix.platform }}
@@ -24,7 +31,24 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Resolve and validate the release version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH, for example v1.2.3" >&2
+            exit 1
+          fi
+
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$version" != "$cargo_version" ]]; then
+            echo "Tag version $version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+          echo "MINIME_VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -43,31 +67,91 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
+      - name: Build Windows or Linux binary
+        if: runner.os != 'macOS'
+        env:
+          MINIME_APP_ID: ${{ env.OFFICIAL_BUNDLE_ID }}
         run: cargo build --release
 
-      - name: Package macOS application
+      - name: Install the Developer ID certificate
         if: runner.os == 'macOS'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
-          ./scripts/package-macos.sh
-          ditto -c -k --sequesterRsrc --keepParent dist/Minime.app Minime-macos.zip
+          : "${MACOS_CERTIFICATE:?Missing MACOS_CERTIFICATE GitHub secret}"
+          : "${MACOS_CERTIFICATE_PASSWORD:?Missing MACOS_CERTIFICATE_PASSWORD GitHub secret}"
+
+          certificate_path="$RUNNER_TEMP/minime-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/minime-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+
+          echo -n "$MACOS_CERTIFICATE" | base64 --decode -o "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$keychain_path"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path"
+
+          echo "MINIME_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+          echo "MINIME_CERTIFICATE_PATH=$certificate_path" >> "$GITHUB_ENV"
+
+      - name: Build and sign the macOS application
+        if: runner.os == 'macOS'
+        env:
+          MINIME_RELEASE: "1"
+          MINIME_BUNDLE_ID: ${{ env.OFFICIAL_BUNDLE_ID }}
+          MINIME_BUILD_NUMBER: ${{ github.run_number }}
+          MINIME_SIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: ./scripts/package-macos.sh
+
+      - name: Notarize and staple the macOS application
+        if: runner.os == 'macOS'
+        env:
+          MINIME_BUNDLE_ID: ${{ env.OFFICIAL_BUNDLE_ID }}
+          MINIME_NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          MINIME_NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MINIME_NOTARY_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          ./scripts/notarize-macos.sh
+          cp "dist/Minime-${MINIME_VERSION}-macos.zip" .
 
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/release/minime.exe -DestinationPath Minime-windows.zip
+        run: Compress-Archive -Path target/release/minime.exe -DestinationPath "Minime-$env:MINIME_VERSION-windows.zip"
 
       - name: Package Linux binary
         if: runner.os == 'Linux'
-        run: tar -czf Minime-linux.tar.gz -C target/release minime
+        run: tar -czf "Minime-${MINIME_VERSION}-linux.tar.gz" -C target/release minime
 
-      - uses: actions/upload-artifact@v4
+      - name: Remove the temporary signing keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [[ -n "${MINIME_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$MINIME_KEYCHAIN_PATH" || true
+          fi
+          rm -f "${MINIME_CERTIFICATE_PATH:-$RUNNER_TEMP/minime-developer-id.p12}"
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: Minime-${{ matrix.platform }}
+          name: Minime-${{ github.ref_name }}-${{ matrix.platform }}
           path: |
-            Minime-macos.zip
-            Minime-windows.zip
-            Minime-linux.tar.gz
+            Minime-*-macos.zip
+            Minime-*-windows.zip
+            Minime-*-linux.tar.gz
           if-no-files-found: error
 
   publish:
@@ -76,15 +160,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          pattern: Minime-*
+          pattern: Minime-v*-*
           merge-multiple: true
+          path: release-assets
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            Minime-macos.zip
-            Minime-windows.zip
-            Minime-linux.tar.gz
-          generate_release_notes: true
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" release-assets/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" release-assets/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Minime $GITHUB_REF_NAME"
+          fi
