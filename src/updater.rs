@@ -166,7 +166,7 @@ fn is_official_build() -> bool {
 fn install_directory() -> Result<PathBuf> {
     env::current_exe()?
         .parent()
-        .map(Path::to_path_buf)
+        .map(|path| path.to_path_buf())
         .context("Unable to locate the Minime install directory")
 }
 
