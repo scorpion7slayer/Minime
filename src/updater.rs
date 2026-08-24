@@ -1,9 +1,9 @@
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
-};
+use std::{env, path::PathBuf, process::Command, time::Duration};
+
+#[cfg(unix)]
+use std::fs;
+#[cfg(any(unix, test))]
+use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
 use axoupdater::{AxoUpdater, ReleaseSource, ReleaseSourceType, Version};
@@ -210,6 +210,7 @@ fn application_bundle_from_executable(executable: &Path) -> Result<PathBuf> {
     Ok(bundle.to_path_buf())
 }
 
+#[cfg(any(unix, test))]
 fn backup_path(path: &Path) -> Result<PathBuf> {
     let file_name = path
         .file_name()
@@ -220,6 +221,7 @@ fn backup_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn cleanup_update_backup_inner() -> Result<()> {
+    #[cfg(unix)]
     let executable = env::current_exe().context("Unable to locate the Minime executable")?;
 
     #[cfg(target_os = "macos")]
